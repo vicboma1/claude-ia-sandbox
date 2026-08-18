@@ -1,0 +1,56 @@
+
+services:
+  debian:
+    image: debian:stable
+    container_name: debian-server-sandbox
+    stdin_open: true
+    tty: true
+    environment:
+      #export ANTHROPIC_API_KEY="..." en termianl
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    restart: unless-stopped
+    ## ssh-keygen -R "[localhost]:2220" -> para borrar registro en maquina local del ssh
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+
+        apt-get update
+        apt-get install -y openssh-server sudo curl wget vim net-tools iputils-ping procps
+        apt-get clean
+
+        useradd -m -s /bin/bash test
+        echo 'test:test' | chpasswd
+        usermod -aG sudo test
+
+        mkdir -p /etc/sudoers.d
+        echo 'test ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/test
+        chmod 440 /etc/sudoers.d/test
+
+        mkdir -p /run/sshd
+
+        echo 'export PATH=$HOME/.local/bin:$PATH' >> /home/test/.bashrc
+
+        su - test -c 'curl -fsSL https://claude.ai/install.sh | bash'
+
+        echo "Comprobando Claude..."
+        ls -l /home/test/.local/bin/claude
+
+        su - test -c '/home/test/.local/bin/claude --version'
+
+        #su - test -c 'cd /data && /home/test/.local/bin/claude auth status
+        #su - test -c 'cd /data && /home/test/.local/bin/claude -p \"Analiza este proyecto y dime qué problemas encuentras\"'
+
+        /usr/sbin/sshd
+
+        tail -f /dev/null
+    volumes:
+      - ./data:/data
+    ports:
+      - "2220:22"
+    networks:
+      - lab
+networks:
+  lab:
+    driver: bridge
