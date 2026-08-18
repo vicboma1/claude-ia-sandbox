@@ -1,0 +1,57 @@
+name: Start sandbox
+description: Levanta el contenedor sandbox con docker compose y espera a que termine el aprovisionamiento
+
+inputs:
+  anthropic-api-key:
+    description: Valor para ANTHROPIC_API_KEY dentro del contenedor
+    required: true
+  service:
+    description: Nombre del servicio en docker-compose.yml
+    required: false
+    default: debian
+  container:
+    description: container_name del servicio
+    required: false
+    default: debian-server-sandbox
+  timeout-seconds:
+    description: Tiempo máximo de espera al aprovisionamiento
+    required: false
+    default: '600'
+
+runs:
+  using: composite
+  steps:
+    - name: docker compose up
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+      run: docker compose up -d
+
+    - name: Esperar a que termine el aprovisionamiento (sshd arriba)
+      shell: bash
+      env:
+        SERVICE: ${{ inputs.service }}
+        CONTAINER: ${{ inputs.container }}
+        WAIT_TIMEOUT: ${{ inputs.timeout-seconds }}
+      run: |
+        deadline=$((SECONDS + WAIT_TIMEOUT))
+        until docker compose exec -T "$SERVICE" pgrep -x sshd >/dev/null 2>&1; do
+          state=$(docker inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo missing)
+          restarts=$(docker inspect -f '{{.RestartCount}}' "$CONTAINER" 2>/dev/null || echo 0)
+
+          if [ "$state" != "running" ]; then
+            echo "::error::El contenedor no está corriendo (estado=$state)"
+            exit 1
+          fi
+          if [ "$restarts" != "0" ]; then
+            # restart: unless-stopped reintenta en bucle y el segundo arranque falla en useradd.
+            echo "::error::El contenedor se ha reiniciado $restarts vez/veces: el script de arranque falló"
+            exit 1
+          fi
+          if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "::error::Timeout (${WAIT_TIMEOUT}s) esperando a sshd"
+            exit 1
+          fi
+          sleep 5
+        done
+        echo "sshd operativo tras ${SECONDS}s"

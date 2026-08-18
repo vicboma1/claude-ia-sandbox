@@ -1,0 +1,293 @@
+name: Test sandbox container
+
+# Levanta el contenedor sandbox tal cual lo hace un desarrollador (docker compose up)
+# y valida el aprovisionamiento: usuario, sudo, SSH, Claude Code y volumen /data.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Lunes 06:00 UTC: detecta roturas externas (imagen debian:stable, instalador de Claude).
+    - cron: '0 6 * * 1'
+
+env:
+  SERVICE: debian
+  CONTAINER: debian-server-sandbox
+  SSH_PORT: '2220'
+
+jobs:
+  lint:
+    name: Lint compose + script de arranque
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validar docker-compose.yml
+        env:
+          ANTHROPIC_API_KEY: dummy-key-for-lint
+        run: docker compose config --quiet
+
+      - name: Shellcheck del script embebido en command
+        env:
+          ANTHROPIC_API_KEY: dummy-key-for-lint
+        run: |
+          docker compose config --format json \
+            | jq -r '.services.debian.command[-1]' > /tmp/entrypoint.sh
+          echo "--- script extraído ---"
+          cat /tmp/entrypoint.sh
+          shellcheck --shell=bash --severity=error /tmp/entrypoint.sh
+
+  sandbox:
+    name: Arrancar y testear el sandbox
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar sshpass (cliente SSH de pruebas)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Preparar volumen ./data con fichero sonda
+        run: |
+          mkdir -p data
+          echo "probe-from-host-${GITHUB_RUN_ID}" > data/ci-probe.txt
+
+      - name: Levantar el sandbox
+        uses: ./.github/actions/start-sandbox
+        with:
+          # En PRs desde forks los secrets no están disponibles: se usa una clave falsa.
+          # El aprovisionamiento no llama a la API, solo necesita la variable definida.
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY || 'dummy-key-for-ci' }}
+          service: ${{ env.SERVICE }}
+          container: ${{ env.CONTAINER }}
+
+      - name: Test - contenedor sano y sin reinicios
+        run: |
+          test "$(docker inspect -f '{{.State.Running}}' "$CONTAINER")" = "true"
+          test "$(docker inspect -f '{{.RestartCount}}' "$CONTAINER")" = "0"
+
+      - name: Test - herramientas base instaladas
+        run: |
+          docker compose exec -T "$SERVICE" bash -c '
+            set -e
+            for bin in curl wget vim ping netstat ps sshd sudo; do
+              command -v "$bin" >/dev/null || { echo "falta $bin"; exit 1; }
+            done
+          '
+
+      - name: Test - usuario test creado con sudo
+        run: |
+          docker compose exec -T "$SERVICE" bash -c '
+            set -e
+            id test
+            getent passwd test | grep -q "/bin/bash"
+            id -nG test | tr " " "\n" | grep -qx sudo
+            test -f /etc/sudoers.d/test
+            test "$(stat -c %a /etc/sudoers.d/test)" = "440"
+          '
+
+      - name: Test - sudo sin contraseña
+        run: |
+          uid=$(docker compose exec -T "$SERVICE" su - test -c 'sudo -n id -u' | tr -d '\r\n')
+          test "$uid" = "0" || { echo "::error::sudo -n no devolvió uid 0 (obtenido: '$uid')"; exit 1; }
+
+      - name: Test - Claude Code instalado y responde
+        run: |
+          docker compose exec -T "$SERVICE" test -x /home/test/.local/bin/claude
+          version=$(docker compose exec -T "$SERVICE" su - test -c '/home/test/.local/bin/claude --version' | tr -d '\r')
+          echo "claude --version -> $version"
+          test -n "$version"
+
+      - name: Test - claude en el PATH de una shell de login interactiva
+        run: |
+          # El export vive al final de ~/.bashrc, que solo se ejecuta en shells interactivas.
+          resolved=$(docker compose exec -T "$SERVICE" su - test -c 'bash -lic "command -v claude"' 2>/dev/null | tr -d '\r')
+          echo "command -v claude -> $resolved"
+          test "$resolved" = "/home/test/.local/bin/claude"
+
+      - name: Test - ANTHROPIC_API_KEY inyectada en el contenedor
+        run: |
+          # No se imprime el valor, solo se comprueba que está definida y no vacía.
+          docker compose exec -T "$SERVICE" bash -c '[ -n "${ANTHROPIC_API_KEY:-}" ]' \
+            || { echo "::error::ANTHROPIC_API_KEY no está definida dentro del contenedor"; exit 1; }
+
+      - name: Test - volumen ./data montado en ambos sentidos
+        run: |
+          # host -> contenedor
+          docker compose exec -T "$SERVICE" grep -q "probe-from-host-${GITHUB_RUN_ID}" /data/ci-probe.txt
+          # contenedor -> host
+          docker compose exec -T "$SERVICE" bash -c 'echo "probe-from-container" > /data/ci-probe-back.txt'
+          grep -q "probe-from-container" data/ci-probe-back.txt
+
+      - name: Test - sshd escuchando en el puerto 22 del contenedor
+        run: |
+          docker compose exec -T "$SERVICE" bash -c 'netstat -tlnp | grep -q ":22 "'
+
+      - name: Test - puerto 2220 publicado en el host
+        run: |
+          timeout 10 bash -c "until </dev/tcp/127.0.0.1/${SSH_PORT}; do sleep 1; done" \
+            || { echo "::error::El puerto ${SSH_PORT} no acepta conexiones"; exit 1; }
+
+      - name: Test - login SSH con test/test
+        run: |
+          ssh_run() {
+            sshpass -p test ssh \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o LogLevel=ERROR \
+              -o ConnectTimeout=10 \
+              -p "$SSH_PORT" test@127.0.0.1 "$1"
+          }
+          who=$(ssh_run 'whoami' | tr -d '\r')
+          test "$who" = "test" || { echo "::error::whoami devolvió '$who'"; exit 1; }
+
+          # sudo a través de SSH
+          root=$(ssh_run 'sudo -n whoami' | tr -d '\r')
+          test "$root" = "root" || { echo "::error::sudo por SSH devolvió '$root'"; exit 1; }
+
+          # el /data compartido es visible desde la sesión SSH
+          ssh_run "grep -q probe-from-host-${GITHUB_RUN_ID} /data/ci-probe.txt"
+
+      - name: Diagnóstico en caso de fallo
+        if: failure()
+        run: |
+          echo "::group::docker compose ps"
+          docker compose ps --all
+          echo "::endgroup::"
+          echo "::group::docker inspect"
+          docker inspect "$CONTAINER" --format '{{json .State}}' | jq . || true
+          echo "::endgroup::"
+          echo "::group::docker compose logs"
+          docker compose logs --no-color --tail 500
+          echo "::endgroup::"
+
+      - name: Limpieza
+        if: always()
+        run: docker compose down --volumes --remove-orphans
+
+  preflight:
+    name: Comprobar credenciales
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      has-key: ${{ steps.check.outputs.has-key }}
+    steps:
+      - name: ¿Hay ANTHROPIC_API_KEY?
+        id: check
+        env:
+          HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          echo "has-key=$HAS_KEY" >> "$GITHUB_OUTPUT"
+          if [ "$HAS_KEY" != "true" ]; then
+            echo "::notice::ANTHROPIC_API_KEY no configurada: se omite el análisis con Claude"
+          fi
+
+  claude-analysis:
+    name: Análisis del proyecto con Claude
+    needs: [preflight, sandbox]
+    # Solo con secret disponible (nunca en PRs, para no gastar tokens ni exponer la clave).
+    if: needs.preflight.outputs.has-key == 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CLAUDE_MODEL: claude-opus-5
+      CLAUDE_PROMPT: Analiza este proyecto y dime qué problemas encuentras
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copiar el proyecto en el volumen ./data
+        run: |
+          mkdir -p data
+          # Solo ficheros versionados en HEAD: sin .git, sin basura del runner.
+          git archive HEAD | tar -x -C data
+          chmod -R a+rwX data
+          find data -maxdepth 2 -printf '%P\n' | sort
+
+      - name: Levantar el sandbox
+        uses: ./.github/actions/start-sandbox
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          service: ${{ env.SERVICE }}
+          container: ${{ env.CONTAINER }}
+
+      - name: Ejecutar claude -p sobre /data
+        run: |
+          set -o pipefail
+          # -u test: docker exec conserva el entorno del contenedor (ANTHROPIC_API_KEY),
+          # a diferencia de `su - test`, que lo descarta al abrir sesión de login.
+          timeout 900 docker compose exec -T \
+            -u test \
+            -e HOME=/home/test \
+            -e CI=true \
+            -w /data \
+            "$SERVICE" \
+            /home/test/.local/bin/claude \
+              -p "$CLAUDE_PROMPT" \
+              --model "$CLAUDE_MODEL" \
+              --permission-mode bypassPermissions \
+              --output-format json \
+            > claude-analysis.json 2> claude-stderr.log
+
+      - name: Validar y publicar el análisis
+        run: |
+          if ! jq -e . claude-analysis.json >/dev/null 2>&1; then
+            echo "::error::Claude no devolvió JSON válido"
+            echo "--- stderr ---"; cat claude-stderr.log
+            echo "--- stdout ---"; cat claude-analysis.json
+            exit 1
+          fi
+
+          if [ "$(jq -r '.is_error // false' claude-analysis.json)" != "false" ]; then
+            echo "::error::Claude terminó con error: $(jq -r '.subtype // "desconocido"' claude-analysis.json)"
+            jq -r '.result // empty' claude-analysis.json
+            exit 1
+          fi
+
+          jq -r '.result' claude-analysis.json > claude-analysis.md
+          test -s claude-analysis.md || { echo "::error::El análisis vino vacío"; exit 1; }
+
+          turns=$(jq -r '.num_turns // "?"' claude-analysis.json)
+          secs=$(jq -r 'if .duration_ms then (.duration_ms / 1000 | floor) else "?" end' claude-analysis.json)
+          cost=$(jq -r '.total_cost_usd // "?"' claude-analysis.json)
+
+          {
+            echo "## Análisis del proyecto por Claude"
+            echo
+            echo "Modelo \`${CLAUDE_MODEL}\` · ${turns} turno(s) · ${secs}s · \$${cost}"
+            echo
+            echo "> ${CLAUDE_PROMPT}"
+            echo
+            cat claude-analysis.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::group::Análisis"
+          cat claude-analysis.md
+          echo "::endgroup::"
+
+      - name: Subir el análisis como artefacto
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-analysis
+          path: |
+            claude-analysis.json
+            claude-analysis.md
+            claude-stderr.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Diagnóstico en caso de fallo
+        if: failure()
+        run: |
+          echo "::group::docker compose logs"
+          docker compose logs --no-color --tail 200
+          echo "::endgroup::"
+
+      - name: Limpieza
+        if: always()
+        run: docker compose down --volumes --remove-orphans
